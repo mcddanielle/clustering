@@ -149,8 +149,8 @@ main(int argc,char *argv[])
   //if directory doesn't exist, make directory
   //make and/or open directory snapshot_files
   struct stat st = {0};       //null directory
-  if (stat("velocity_data", &st) == -1) {
-    mkdir("velocity_data",0700);
+  if (stat("neighbor_data", &st) == -1) {
+    mkdir("neighbor_data",0700);
   }
   
   //parameters
