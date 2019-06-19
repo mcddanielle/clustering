@@ -1,6 +1,6 @@
-/* 6.10.19 
- * having some interface problems with this code.  
- * lets dig in and see what is going wrong
+/* 6.19.19 
+ * Revised to measure not only dr, but sort dr before printing.
+ * also calculating the average
  *
  * 1.23.19
  *
@@ -47,18 +47,8 @@ struct vortex{
 
   //DM measurements
   int neighbor_count;
-  //double neighbor_distance_list[100];
 
-
-  /*trying to emulate this:
-    for(j=0;j<lookupdata.ncellsy;j++){
-    for(i=0;i<lookupdata.ncellsx;i++){
-    lookuptable[i][j].num=0;
-    lookuptable[i][j].list=malloc(maxcell*sizeof(int));
-    }
-    }
-
-   */
+  //you could put dr here and save... but I don't think it would help.
   
 };
 
@@ -130,22 +120,36 @@ void distance(double *dr, double *dx, double *dy,
 void get_parameters_file(struct parameters *parameters,
 			 struct syssize *syssize);
 
-void pair_interact(int id1,int id2,struct vortex *vortex,
+double pair_interact(int id1,int id2,struct vortex *vortex,
 		   struct syssize syssize,
 		   struct parameters parameters,
 		   FILE *out);
 
+int compare (double *num1, double *num2);
+
+void name_outfile(int time, char *ascii_file, char *filename);
+
+int read_frame(FILE *in,int *nV,int *time,struct vortex *vortex);
 
 
+//----------------------------------------------------------------//
 
-main(int argc,char *argv[])
+
+int main(int argc,char *argv[])
 {
   //file names/pointers
-  FILE *in,*out; //
+  FILE *in,*out,*feature_out; //
 
-  char ascii_file[120]; //="velocity_data/XV_data_t=";
+  //for naming files and reading in with fscanf
+  char ascii_file[120]; 
+  char feature_file[120]; 
+
   char str_time[10];
-
+  int read_items;
+  char trash[120];
+  int trash_int;
+  float dr;
+  
   //if directory doesn't exist, make directory
   //make and/or open directory snapshot_files
   struct stat st = {0};       //null directory
@@ -153,12 +157,13 @@ main(int argc,char *argv[])
     mkdir("neighbor_data",0700);
   }
   
-  //parameters
+  //simulation parameters
   double density;
   struct syssize syssize;
   int runtime;
   int maxtime;
-
+  int writemovietime;
+  
   //contains everything from Pa0, easy to pass around
   struct parameters parameters;
   
@@ -170,7 +175,7 @@ main(int argc,char *argv[])
   char filename[120]="smtest";
   int nV, time, nVold;
   int i,j,k;
-
+  
   int frame;
   
   //grab everything from Pa0
@@ -181,27 +186,41 @@ main(int argc,char *argv[])
   maxtime = parameters.maxtime;
   runtime = parameters.runtime;
   density = parameters.density;
+  writemovietime = parameters.writemovietime;
 
-
+  nV = maxnum;
+  
   //more system specific.  vortex struct only contains maxnum
   //and we create room for a neighbor list at the end.
   vortex=malloc(maxnum*sizeof(struct vortex));
-  // + (maxnum+1)*sizeof(double) );
 
   //make an array to calculate all of the averages
   //within every frame.
   //so every frame we zero all the values
   //and then do a running total within the frame
-  double rN_average[maxnum];
+  double rN_average[maxnum-1];
+  double dr_probe[maxnum-1];
 
-  //add the information from smtest
-  if(argc<2){
-    // printf("Enter name of movie: ");
-    // scanf("%s",filename);
+  int arraylen = sizeof(dr_probe) / sizeof(double);
+
+  if(DEBUG)
+    printf("%d %d\n",nV,arraylen);
+  
+  //for each new frame, the average neighbor distances are reset to zero
+  for(i=0;i<(nV-1);i++){
+    
+    //do a += continuously as you accumulate each frame -
+    //normalize at end of smtest
+    rN_average[i] = 0.0;
+
+    //this is a particle by particle measure,
+    //so it gets filled up and rewritten for every particle
+    //so you need to write it somewhere - either an array or file
+    //and then reload it to subtract off normalized values later
+    dr_probe[i] = 0.0;
   }
-  else
-    sscanf(argv[1],"%s",filename);
-
+    
+  //open the smtest file
   if((in=fopen(filename,"r"))==NULL){
     printf("Error opening file %s\n",filename);
     exit(-1);
@@ -213,7 +232,6 @@ main(int argc,char *argv[])
   //and each value is normalized across particles
   //such that nn=1 is averaged and subtracted, likewise nn=2, etc
   
-  // out=fopen("delta_rN.dat","w");
 
   if(DEBUG){
     f_debug = fopen("debug.dat","w");
@@ -222,52 +240,138 @@ main(int argc,char *argv[])
   //TODO-----------------------------------------
   //total movie stats - update for new measures
   frame=0;
-
-  //for each new frame, the average neighbor distances are reset to zero
-  for(i=0;i<nV-1;i++){
-    rN_average[i] = 0.0;
-  }
   
   //read in all frames of smtest and analyze individually
   while(!feof(in)){
-    frame++;
+    frame++;  
     nVold=nV;
     completeframe=read_frame(in,&nV,&time,vortex);
-
+    
     //cut early frames
     if(!completeframe) break;
-    if(frame==0) continue;
 
-    //open file to write data
-    strcpy(ascii_file,"neighbor_data/frame_");
-    sprintf(str_time,"%08d",time); //convert current to a string   
-    strcat(ascii_file,str_time);
-    if(DEBUG) printf("printing frame data to %s\n",ascii_file);
+    //often this is a square array, we don't want stats on
+    if(time==0) continue;
 
-    if((out=fopen(ascii_file,"w"))==NULL){
+    //name file to write data - we'll do in subroutine to clean up
+    name_outfile(time,ascii_file,"neighbor_data/frame_");    
+
+    if((out=fopen(ascii_file,"rw"))==NULL){
       printf("Error opening file %s\n",ascii_file);
       exit(-1);
     }
-    //------------------------------------
 
+    //zero all rN data before new particle analysis double loop
+    //for each new frame, the average neighbor distances are reset to zero
+    for(i=0;i<(nV-1);i++){
+    
+      //do a += continuously as you accumulate each frame -
+      //normalize at end of FRAME D
+      rN_average[i] = 0.0;
+    }
+
+    //------------------------------------
+    //loop through all particles
     for(i=0;i<nV;i++){
-      fprintf(out,"#frame %d, particle %d\n",frame,i);
+
+      //zero the neighbor counter for every new probe particle i
+      k=0;
+      
+      //fprintf(out,"#particle %d\n",i);
+
+      //and all their neighbors -
+      //each particle is a distinct probe, so we don't do j<i
       for(j=0;j<nV;j++){
 
 	if(i!=j){
-	  pair_interact(i,j,vortex,syssize,parameters,out);
+	  //calculate the dr for each pair
+	  dr_probe[k] = pair_interact(i,j,vortex,syssize,parameters,out);
+	  k++;
 	}
 	
-      }      
-    }
+      }//exit the j portion of the double loop, the neighbors of i
+
+      //make some i probe specific calculations
+      
+      //qsort the dr values
+      qsort (dr_probe,arraylen,sizeof(double),
+	     (int (*)(const void *, const void *)) compare);
+
+      //before we write over the dr_probe values for the new j
+      //write the values to the array to calculate their average 
+      for(j=0;j<(nV-1);j++){
+	fprintf(out,"%lf\n",dr_probe[j]);
+	rN_average[j] += dr_probe[j];
+      }
+
+    }//exit the i loop over all nV probe particles
+
+    //-------------------------------------------------
+    //end the data accumlation - frame level analysis
+    //-------------------------------------------------
     
+    //normalize the average for the frame D (not over the simulation S).
+    for(i=0;i<(nV-1);i++){
+      rN_average[i] /= (nV-1);
+    }
+
+    //read the data back in from the written frame_data and write feature_data
+    //REWIND!
+    rewind(out);
+
+    //open a new file for writing the feature data -
+    //frame by frame for downsampling
+    name_outfile(time,feature_file,"neighbor_data/feature_");    
+
+    if((feature_out=fopen(feature_file,"w"))==NULL){
+      printf("Error opening file %s\n",feature_file);
+      exit(-1);
+    }
+
+      
+    //FILE STRUCTURE - COMMENT LINE FOR EACH nV particles
+    //followed by nV-1 data lines
+    //i.e. nV lines per particle, of which there are nV, AKA (nV^2)
+
+    for(i=0;i<nV;i++){
+      
+      //read_items = fscanf(out,"%s %d",trash,&trash_int);
+      //printf("%s %d\n",trash,trash_int);
+      //fflush(stdout);
+      //exit(0);
+      
+      fprintf(feature_out,"#particle %d\n",i);
+      
+      for(j=0;j<(nV-1);j++){
+	read_items = fscanf(out,"%f",&dr);
+	fprintf(feature_out,"%f\n",dr - rN_average[j]);
+      }//end j neighbor loop
+      
+    }//end i probe loop
     
     fclose(out);
-
+    fclose(feature_out);
+    
   }//do the same for a new frame (i.e. end while(feof) loop)
 
-  
 
+  //NORMALIZE THE AVERAGES
+  //why oh why is it frame-2?
+  //time 0 = frame 1, time 1 = frame 2. etc, so frames-1?
+  //nope!  get another increment from the while loop going one last time.
+  
+  //for(i=0;i<(nV-1);i++){
+  //  rN_average[i] /= ((frame-2)*(nV-1)) ;
+  //}
+
+  //-----------------------------------------------------------
+  //reopen the written data and subtract off the averages...
+  //---------------------------------------------------------------
+
+  //for(time=writemovietime; time<maxtime; time+=writemovietime){
+  //fclose(out);
+  //}//end time loop
+  
   //--------------------------------------------------------
 
   //  fclose(out);
@@ -276,7 +380,10 @@ main(int argc,char *argv[])
     fclose(f_debug);
   }
 
+  return 0;
 }
+//--------------------------------------------------------------------
+
 
 //------------------------------------------------------------------
 int read_frame(FILE *in,int *nV,int *time,struct vortex *vortex)
@@ -284,15 +391,17 @@ int read_frame(FILE *in,int *nV,int *time,struct vortex *vortex)
   int i;
   float xin,yin,zin;
 
-  fread(nV,sizeof(int),1,in);
-  fread(time,sizeof(int),1,in);
+  int read_items;
+
+  read_items = fread(nV,sizeof(int),1,in);
+  read_items = fread(time,sizeof(int),1,in);
   if(feof(in)) return 0;
   for(i=0;i<*nV;i++){
-    fread(&(vortex[i].color),sizeof(int),1,in);
-    fread(&(vortex[i].id),sizeof(int),1,in);
-    fread(&xin,sizeof(float),1,in);
-    fread(&yin,sizeof(float),1,in);
-    fread(&zin,sizeof(float),1,in);
+    read_items = fread(&(vortex[i].color),sizeof(int),1,in);
+    read_items = fread(&(vortex[i].id),sizeof(int),1,in);
+    read_items = fread(&xin,sizeof(float),1,in);
+    read_items = fread(&yin,sizeof(float),1,in);
+    read_items = fread(&zin,sizeof(float),1,in);
     vortex[i].x=(double)xin;
     vortex[i].y=(double)yin;
     vortex[i].radius=(double)zin;
@@ -308,7 +417,7 @@ int read_frame(FILE *in,int *nV,int *time,struct vortex *vortex)
 
 //---------------------------------------------------------
 //---------------------------------------------------------
-void pair_interact(int id1,int id2,
+double pair_interact(int id1,int id2,
 		   struct vortex *vortex,
 		   struct syssize syssize,
 		   struct parameters parameters,
@@ -333,31 +442,12 @@ void pair_interact(int id1,int id2,
 
   //just print dr since that is the only analysis we are using.  save data.
   //fprintf(out,"%d\t %d\t %f\t %f\t %f \n",id1, id2, dr,dx,dy);    
-  fprintf(out,"%f\n",dr);    
-
-  //Assign the measured distance to the neighbor arrays in each vortex struct.
-  //vortex[id1].neighbor_distance_list[vortex[id1].neighbor_count] = dr;
-  //vortex[id1].neighbor_count++;
-  
-  //if(vortex[id1].neighbor_count > parameters.maxnum){
-  //  printf("Exceeded max number of total distances!\n");
-  //  fflush(stdout);
-  //  exit(-1);
-  //}
-
-  //vortex[id2].neighbor_distance_list[vortex[id2].neighbor_count] = dr;
-  //vortex[id2].neighbor_count++;
-
-  //if(vortex[id2].neighbor_count > parameters.maxnum){
-  //  printf("Exceeded max number of total distances!\n");
-  //  fflush(stdout);	
-  //  exit(-1);
-  //}
+  //fprintf(out,"%f\n",dr);    
 	
 
-  return;
+  return dr;
   
-}//end subroutine.  
+}//end subroutine.  return dr by value
 
 //-------------------------------------------------------------
 
@@ -372,6 +462,8 @@ void get_parameters_file(struct parameters *parameters,
   double cellsize,length_scale;
   double resolution;
 
+  //to eliminate all the damn warnings
+  int read_int;
   
   resolution=1e-6;
 
@@ -382,10 +474,10 @@ void get_parameters_file(struct parameters *parameters,
   else if (VERBOSE) printf("reading Pa0.\n");
   fflush(stdout);
 
-  fscanf(in,"%s %lf\n",trash,&((*parameters).density));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).density));
   //fscanf(in,"%s %lf\n",trash,&((*parameters).phi2_small));
   //fscanf(in,"%s %lf\n",trash,&((*parameters).phi1_big));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).pdensity));
+  read_int =fscanf(in,"%s %lf\n",trash,&((*parameters).pdensity));
 
   //----------------------------------------------------------------------
   //check whether the user gave you sensible choices for the two densities
@@ -404,13 +496,13 @@ void get_parameters_file(struct parameters *parameters,
   fflush(stdout);
 
   //-
-  fscanf(in,"%s %lf\n",trash,&((*syssize).SX));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*syssize).SX));
   (*syssize).SX2=(*syssize).SX*0.5;
   //--
-  fscanf(in,"%s %lf\n",trash,&((*syssize).SY));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*syssize).SY));
   (*syssize).SY2=(*syssize).SY*0.5;
   
-  fscanf(in,"%s %lf\n",trash,&((*parameters).radius)); //_small));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).radius)); //_small));
   //fscanf(in,"%s %lf\n",trash,&((*parameters).radius_large));
 
   //--where it is appropriate to accurately calculate maxnum
@@ -426,33 +518,34 @@ void get_parameters_file(struct parameters *parameters,
   if(VERBOSE) printf("\n maxnum is: %d\n", (*parameters).maxnum);
   //--
  
-  fscanf(in,"%s %d\n",trash,&((*parameters).runtime));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).runforce));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).dt));
-  fscanf(in,"%s %d\n",trash,&((*parameters).maxtime));
+  read_int = fscanf(in,"%s %d\n",trash,&((*parameters).runtime));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).runforce));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).dt));
+  read_int = fscanf(in,"%s %d\n",trash,&((*parameters).maxtime));
   if(VERBOSE) printf("\n maxtime is: %d\n", (*parameters).maxtime);
 
     
-  fscanf(in,"%s %d\n",trash,&((*parameters).writemovietime));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).kspring));
+  read_int = fscanf(in,"%s %d\n",trash,&((*parameters).writemovietime));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).kspring));
   
-  fscanf(in,"%s %lf\n",trash,&cellsize); // size of lookup cell
-  fscanf(in,"%s %lf\n",trash,&((*parameters).potential_radius));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).potential_mag));
+  read_int = fscanf(in,"%s %lf\n",trash,&cellsize); // size of lookup cell
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).potential_radius));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).potential_mag));
   
-  fscanf(in,"%s %lf\n",trash,&length_scale);
-  fscanf(in,"%s %lf\n",trash,&((*parameters).drive_mag));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).drive_frq));
-  fscanf(in,"%s %d\n",trash,&((*parameters).decifactor));
+  read_int = fscanf(in,"%s %lf\n",trash,&length_scale);
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).drive_mag));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).drive_frq));
+  read_int = fscanf(in,"%s %d\n",trash,&((*parameters).decifactor));
   
   //starting from a file?
-  fscanf(in,"%s %d\n",trash,&((*parameters).restart));
+  read_int = fscanf(in,"%s %d\n",trash,&((*parameters).restart));
 
   //ramping the drive rate?
-  fscanf(in,"%s %d\n",trash,&((*parameters).drive_step_time));
-  fscanf(in,"%s %lf\n",trash,&((*parameters).drive_step_force));
+  read_int =fscanf(in,"%s %d\n",trash,&((*parameters).drive_step_time));
+  read_int = fscanf(in,"%s %lf\n",trash,&((*parameters).drive_step_force));
   
   fclose(in);
+
 }
 
 //-----------------------------------------------------------------
@@ -475,3 +568,34 @@ void distance(double *dr,double *dx,double *dy,double x1,double y1,
 }
 
 
+//------------------------------------------------------------
+int compare (double *num1, double *num2)
+{
+  if (*num1 < *num2) return -1;
+  else if (*num1 == *num2) return 0;
+  return 1;
+}
+
+//--------------------------------------------------------------
+void name_outfile(int time, char *ascii_file, char *filename){
+
+  //char ascii_file[120]; 
+  char str_time[10];
+  //open file to write data
+  strcpy(ascii_file,filename);
+  sprintf(str_time,"%08d",time); //convert current to a string   
+  strcat(ascii_file,str_time);
+  
+  if(DEBUG)
+    printf("printing frame data to %s\n",ascii_file);
+
+  //------------------------------------------------------------
+  //CAUSES SEGFAULT - EASER TO DO IT IN MAIN FUNCTION
+  //------------------------------------------------------------
+  //if((out=fopen(ascii_file,"w"))==NULL){
+  //  printf("Error opening file %s\n",ascii_file);
+  //  exit(-1);
+  //}
+
+  return;
+}
